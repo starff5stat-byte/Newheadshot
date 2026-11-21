@@ -96,6 +96,12 @@ object Config {
     const val SWIPE_FACTOR = 0.55f
     const val SWIPE_MODE_AWAY_FROM_TARGET = true
     const val TEMPLATE_EVERY_N_FRAMES = 2
+    const val PAIR_MATCH_THRESHOLD = 0.45
+    const val BODY_CONF_FACTOR = 0.85
+    const val BODY_DEFAULT_TOP = 0.0
+    const val BODY_DEFAULT_HEIGHT = 0.10
+    const val BODY_DEFAULT_WIDTH = 0.45
+    const val BODY_DEFAULT_CENTER_X = 0.5
     val TRIGGER_ROI: Rect? = null
 }
 
@@ -125,20 +131,32 @@ data class Box(val left: Int, val top: Int, val right: Int, val bottom: Int, val
     val cy: Int get() = (top + bottom) / 2
 }
 
-data class FrameResult(val triggerActive: Boolean, val candidates: List<Box>, val selected: Box?)
+data class FrameResult(
+    val triggerActive: Boolean,
+    val candidates: List<Box>,
+    val selected: Box?,
+    val bodies: List<Box>
+)
 
 class DetectionEngine(private val context: Context) {
 
     private val targetTemplates = mutableListOf<Mat>()
+    private val bodyTemplates = mutableListOf<Mat>()
     private val triggerTemplates = mutableListOf<Pair<String, Mat>>()
     private var cursorTemplate: Mat? = null
     private var loaded = false
+
+    private var learnedTop = Config.BODY_DEFAULT_TOP
+    private var learnedHeight = Config.BODY_DEFAULT_HEIGHT
+    private var learnedWidth = Config.BODY_DEFAULT_WIDTH
+    private var learnedCenterX = Config.BODY_DEFAULT_CENTER_X
 
     private var refTriggerCx = -1.0
     private var refTriggerCy = -1.0
     private var refTriggerScale = 1.0
 
-    private var lastTemplateBoxes: List<Box> = emptyList()
+    private var lastTemplateHeads: List<Box> = emptyList()
+    private var lastBodies: List<Box> = emptyList()
 
     private val faceOptions = FaceDetectorOptions.Builder()
         .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
@@ -152,8 +170,17 @@ class DetectionEngine(private val context: Context) {
         try {
             val files = context.assets.list("detection") ?: emptyArray<String>()
 
-            files.filter { it.startsWith("target_b") }.sorted().forEach { name ->
-                loadGrayMat("detection/$name")?.let { targetTemplates.add(it) }
+            val headMap = mutableMapOf<Int, Mat>()
+            val bodyMap = mutableMapOf<Int, Mat>()
+
+            files.filter { it.startsWith("target_b") }.forEach { name ->
+                val n = name.removePrefix("target_b").substringBefore(".").toIntOrNull() ?: return@forEach
+                loadGrayMat("detection/$name")?.let { headMap[n] = it; targetTemplates.add(it) }
+            }
+
+            files.filter { it.startsWith("body_b") }.forEach { name ->
+                val n = name.removePrefix("body_b").substringBefore(".").toIntOrNull() ?: return@forEach
+                loadGrayMat("detection/$name")?.let { bodyMap[n] = it; bodyTemplates.add(it) }
             }
 
             files.filter { it.startsWith("trigger_active") }.sorted().forEach { name ->
@@ -164,7 +191,43 @@ class DetectionEngine(private val context: Context) {
             if (normal != null) triggerTemplates.add(0, Pair("normal", normal))
 
             cursorTemplate = loadGrayMat("detection/cursor_a.jpg") ?: loadGrayMat("detection/cursor_a.png")
+
+            learnHeadRatio(headMap, bodyMap)
         } catch (_: Exception) { }
+    }
+
+    private fun learnHeadRatio(headMap: Map<Int, Mat>, bodyMap: Map<Int, Mat>) {
+        var sumTop = 0.0
+        var sumHeight = 0.0
+        var sumWidth = 0.0
+        var sumCenterX = 0.0
+        var count = 0
+
+        for ((n, bodyMat) in bodyMap) {
+            val headMat = headMap[n] ?: continue
+            val m = matchTemplate(bodyMat, headMat, 1.0, 1.0)
+            if (m != null && m.value >= Config.PAIR_MATCH_THRESHOLD) {
+                val bw = bodyMat.cols().toDouble()
+                val bh = bodyMat.rows().toDouble()
+                sumTop += m.y / bh
+                sumHeight += m.h / bh
+                sumWidth += m.w / bw
+                sumCenterX += (m.x + m.w / 2.0) / bw
+                count++
+            }
+        }
+
+        if (count > 0) {
+            learnedTop = sumTop / count
+            learnedHeight = sumHeight / count
+            learnedWidth = sumWidth / count
+            learnedCenterX = sumCenterX / count
+        } else {
+            learnedTop = Config.BODY_DEFAULT_TOP
+            learnedHeight = Config.BODY_DEFAULT_HEIGHT
+            learnedWidth = Config.BODY_DEFAULT_WIDTH
+            learnedCenterX = Config.BODY_DEFAULT_CENTER_X
+        }
     }
 
     private fun loadGrayMat(path: String): Mat? {
@@ -184,7 +247,7 @@ class DetectionEngine(private val context: Context) {
 
     fun processFull(bitmap: Bitmap, screenW: Int, screenH: Int, frameIndex: Int): FrameResult {
         ensureLoaded()
-        if (bitmap.width <= 0 || bitmap.height <= 0) return FrameResult(false, emptyList(), null)
+        if (bitmap.width <= 0 || bitmap.height <= 0) return FrameResult(false, emptyList(), null, emptyList())
 
         AppState.cursorX = screenW / 2
         AppState.cursorY = screenH / 2
@@ -208,9 +271,11 @@ class DetectionEngine(private val context: Context) {
         }
 
         if (frameIndex % Config.TEMPLATE_EVERY_N_FRAMES == 0) {
-            lastTemplateBoxes = detectTemplateTargets(gray, scale, screenW, screenH)
+            val r = detectTemplateTargets(gray, scale, screenW, screenH)
+            lastTemplateHeads = r.first
+            lastBodies = r.second
         }
-        candidates.addAll(lastTemplateBoxes)
+        candidates.addAll(lastTemplateHeads)
 
         val triggerActive = detectTrigger(gray, scale)
 
@@ -222,7 +287,7 @@ class DetectionEngine(private val context: Context) {
         gray.release()
         smallRgba.release()
 
-        return FrameResult(triggerActive, merged, selected)
+        return FrameResult(triggerActive, merged, selected, lastBodies)
     }
 
     private fun detectFaces(smallRgba: Mat, scale: Double, screenW: Int, screenH: Int): List<Box> {
@@ -240,7 +305,7 @@ class DetectionEngine(private val context: Context) {
                         (b.top / scale).toInt().coerceIn(0, screenH),
                         (b.right / scale).toInt().coerceIn(0, screenW),
                         (b.bottom / scale).toInt().coerceIn(0, screenH),
-                        0.90, "face"))
+                        0.95, "face"))
                 }
             }
             smallBmp.recycle()
@@ -248,15 +313,43 @@ class DetectionEngine(private val context: Context) {
         } catch (_: Exception) { emptyList() }
     }
 
-    private fun detectTemplateTargets(gray: Mat, scale: Double, screenW: Int, screenH: Int): List<Box> {
-        val out = mutableListOf<Box>()
+    private fun detectTemplateTargets(gray: Mat, scale: Double, screenW: Int, screenH: Int): Pair<List<Box>, List<Box>> {
+        val heads = mutableListOf<Box>()
+        val bodies = mutableListOf<Box>()
+
         for (t in targetTemplates) {
             val m = matchTemplate(gray, t, scale, 1.0)
             if (m != null && m.value >= Config.TARGET_TEMPLATE_THRESHOLD) {
-                out.add(boxFromMatch(m, scale, screenW, screenH, m.value, "template"))
+                heads.add(boxFromMatch(m, scale, screenW, screenH, m.value, "template"))
             }
         }
-        return out
+
+        for (t in bodyTemplates) {
+            val m = matchTemplate(gray, t, scale, 1.0)
+            if (m != null && m.value >= Config.TARGET_TEMPLATE_THRESHOLD) {
+                val full = boxFromMatch(m, scale, screenW, screenH, m.value, "body")
+                bodies.add(full)
+                heads.add(headBoxFromBody(full))
+            }
+        }
+
+        return Pair(heads, bodies)
+    }
+
+    private fun headBoxFromBody(b: Box): Box {
+        val w = (b.right - b.left).toDouble()
+        val hgt = (b.bottom - b.top).toDouble()
+        val headTop = b.top + (hgt * learnedTop).toInt()
+        val headH = (hgt * learnedHeight).toInt().coerceAtLeast(8)
+        val headW = (w * learnedWidth).toInt().coerceAtLeast(8)
+        val headCx = b.left + (w * learnedCenterX).toInt()
+        return Box(
+            headCx - headW / 2,
+            headTop,
+            headCx + headW / 2,
+            headTop + headH,
+            b.conf * Config.BODY_CONF_FACTOR,
+            "body-head")
     }
 
     private fun detectTrigger(gray: Mat, scale: Double): Boolean {
@@ -358,6 +451,8 @@ class DetectionEngine(private val context: Context) {
     private fun releaseTemplates() {
         targetTemplates.forEach { it.release() }
         targetTemplates.clear()
+        bodyTemplates.forEach { it.release() }
+        bodyTemplates.clear()
         triggerTemplates.forEach { it.second.release() }
         triggerTemplates.clear()
         cursorTemplate?.release()
@@ -370,19 +465,22 @@ class DetectionEngine(private val context: Context) {
 class OverlayView(context: Context) : View(context) {
 
     private val boxPaint = Paint().apply { color = Color.GREEN; style = Paint.Style.STROKE; strokeWidth = 4f }
+    private val bodyPaint = Paint().apply { color = Color.CYAN; style = Paint.Style.STROKE; strokeWidth = 3f }
     private val targetPaint = Paint().apply { color = Color.RED; style = Paint.Style.STROKE; strokeWidth = 6f }
     private val linePaint = Paint().apply { color = Color.YELLOW; style = Paint.Style.STROKE; strokeWidth = 5f }
     private val crossPaint = Paint().apply { color = Color.YELLOW; style = Paint.Style.STROKE; strokeWidth = 4f }
     private val textPaint = Paint().apply { color = Color.WHITE; textSize = 38f; setShadowLayer(8f, 0f, 0f, Color.BLACK) }
 
     @Volatile private var boxes: List<Box> = emptyList()
+    @Volatile private var bodies: List<Box> = emptyList()
     @Volatile private var target: Box? = null
     @Volatile private var cursorX = 0
     @Volatile private var cursorY = 0
     @Volatile private var status = ""
 
-    fun update(boxes: List<Box>, target: Box?, cx: Int, cy: Int, status: String) {
+    fun update(boxes: List<Box>, bodies: List<Box>, target: Box?, cx: Int, cy: Int, status: String) {
         this.boxes = boxes
+        this.bodies = bodies
         this.target = target
         this.cursorX = cx
         this.cursorY = cy
@@ -392,6 +490,10 @@ class OverlayView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+
+        for (b in bodies) {
+            canvas.drawRect(b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), b.bottom.toFloat(), bodyPaint)
+        }
 
         for (b in boxes) {
             canvas.drawRect(b.left.toFloat(), b.top.toFloat(), b.right.toFloat(), b.bottom.toFloat(), boxPaint)
@@ -680,10 +782,11 @@ class ScreenCaptureService : Service() {
 
         val status = "EN:" + (if (AppState.enabled) "ON" else "OFF") +
                 " TRIG:" + (if (res.triggerActive) "YES" else "NO") +
-                " TGT:" + res.candidates.size +
+                " HEAD:" + res.candidates.size +
+                " BODY:" + res.bodies.size +
                 (res.selected?.let { " CONF:" + String.format("%.2f", it.conf) } ?: "")
 
-        AppState.overlayView?.update(res.candidates, res.selected, AppState.cursorX, AppState.cursorY, status)
+        AppState.overlayView?.update(res.candidates, res.bodies, res.selected, AppState.cursorX, AppState.cursorY, status)
 
         if (!AppState.enabled || !res.triggerActive) return
         val t = res.selected ?: return
