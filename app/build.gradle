@@ -33,7 +33,7 @@ android {
 
 dependencies {
     implementation 'androidx.core:core-ktx:1.13.1'
-    implementation 'org.opencv:opencv:4.9.0'
+    implementation 'org.opencv:opencv:4.8.0'
     implementation 'com.google.mlkit:face-detection:16.1.7'
     implementation 'dev.rikka.shizuku:api:13.1.5'
     implementation 'dev.rikka.shizuku:provider:13.1.5'
